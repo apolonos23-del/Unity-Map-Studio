@@ -1,0 +1,23 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "presence": {
+      ".read": "auth != null",
+      "$uid": {
+        ".write": "auth != null && auth.uid == $uid",
+        ".validate": "newData.hasChildren(['state','displayName','role','lastSeen']) && (newData.child('state').val() == 'online' || newData.child('state').val() == 'offline') && newData.child('displayName').isString() && newData.child('lastSeen').isNumber()",
+        "$other": {
+          ".validate": "$other == 'state' || $other == 'displayName' || $other == 'role' || $other == 'lastSeen' || $other == 'currentSessionId' || $other == 'currentCollabProjectId'"
+        }
+      }
+    },
+    "liveClass": {
+      "current": {
+        ".read": "auth != null",
+        ".write": "auth != null && (auth.token.role == 'teacher' || auth.token.role == 'therapist') && (!data.exists() || auth.uid == data.child('teacherId').val()) && (!newData.exists() || auth.uid == newData.child('teacherId').val())",
+        ".validate": "newData.hasChildren(['sessionId','teacherId','teacherName','title','startedAt']) && newData.child('sessionId').isString() && newData.child('teacherName').isString() && newData.child('title').isString() && newData.child('startedAt').isNumber()"
+      }
+    }
+  }
+}

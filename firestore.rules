@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function self(uid) { return signedIn() && request.auth.uid == uid; }
+    function role() { return request.auth.token.get('role', 'student'); }
+    function session(sid) { return get(/databases/$(database)/documents/liveSessions/$(sid)).data; }
+    function teacher(sid) { return signedIn() && session(sid).teacherId == request.auth.uid; }
+    function peer(sid) { return signedIn() && request.auth.uid in session(sid).participantIds; }
+    function liveReader(p) {
+      return p.get('liveSessionId', null) != null
+        && session(p.liveSessionId).teacherId == p.ownerId
+        && (teacher(p.liveSessionId) || peer(p.liveSessionId));
+    }
+    function projectReader(p) {
+      return signedIn() && (p.ownerId == request.auth.uid
+        || (p.get('projectType', '') == 'collaborative' && request.auth.uid in p.get('collabParticipantIds', []))
+        || liveReader(p));
+    }
+    function project(pid) { return get(/databases/$(database)/documents/projects/$(pid)).data; }
+    function validFolder(data) {
+      return data.get('folderId', null) == null
+        || get(/databases/$(database)/documents/folders/$(data.folderId)).data.ownerId == request.auth.uid;
+    }
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if self(uid) && request.resource.data.uid == uid
+        && request.resource.data.role == role()
+        && request.resource.data.keys().hasOnly(['uid','displayName','email','role','workspace','createdAt','lastSeen']);
+      allow update: if self(uid) && request.resource.data.uid == resource.data.uid
+        && request.resource.data.role == role()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName','email','role','workspace','createdAt','lastSeen']);
+      allow delete: if false;
+      match /private/{document=**} { allow read, write: if false; }
+    }
+    match /projects/{pid} {
+      allow read: if projectReader(resource.data);
+      allow create, delete: if false;
+      allow update: if self(resource.data.ownerId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','status','folderId','updatedAt'])
+        && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 160
+        && request.resource.data.status in ['draft','saved','active_collab','archived'] && validFolder(request.resource.data);
+      match /snapshots/{snapshotId} { allow read: if projectReader(project(pid)); allow write: if false; }
+      match /members/{memberId} { allow read: if projectReader(project(pid)); allow write: if false; }
+    }
+    match /liveSessions/{sid} {
+      allow read: if signedIn() && (resource.data.teacherId == request.auth.uid || request.auth.uid in resource.data.participantIds);
+      allow create, delete: if false;
+      allow update: if self(resource.data.teacherId)
+        && resource.data.status in ['active','paused']
+        && request.resource.data.status in ['active','paused']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','editPermissions','presentingBoardId','presentingRoomId','groupRoomsActive','teacherInRoomId','updatedAt','autoExpiredAt'])
+        && request.resource.data.get('editPermissions', []).toSet().difference(resource.data.participantIds.toSet()).size() == 0;
+      match /groupRooms/{gid} {
+        allow read: if teacher(sid) || peer(sid);
+        allow write: if false;
+        match /members/{uid} {
+          allow read: if teacher(sid) || peer(sid);
+          allow create, update: if self(uid) && peer(sid)
+            && request.resource.data.keys().hasOnly(['userId','displayName','joinedAt','leftAt','isCurrentMember','contributed','firstContributionAt'])
+            && request.resource.data.userId == uid
+            && (request.resource.data.get('contributed',false) == false
+              || (session(sid).status == 'active' && uid in get(/databases/$(database)/documents/liveSessions/$(sid)/groupRooms/$(gid)).data.participantIds)
+              || (resource != null && resource.data.get('contributed',false) == true));
+          allow delete: if false;
+        }
+      }
+    }
+    match /invitations/{iid} {
+      allow read, delete: if signedIn() && (resource.data.fromUserId == request.auth.uid || resource.data.toUserId == request.auth.uid);
+      allow create, update: if false;
+    }
+    match /receivedDesigns/{did} {
+      allow read: if signedIn() && (resource.data.fromUserId == request.auth.uid || resource.data.toUserId == request.auth.uid);
+      allow write: if false;
+    }
+    match /folders/{fid} {
+      allow read, delete: if self(resource.data.ownerId);
+      allow create: if self(request.resource.data.ownerId) && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 160;
+      allow update: if self(resource.data.ownerId) && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','updatedAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 160;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,6 @@
+strictDepBuilds: false
+allowBuilds:
+  '@firebase/util': false
+  core-js: false
+  protobufjs: false
+  esbuild: true

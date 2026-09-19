@@ -1,0 +1,10 @@
+{
+  "indexes": [
+    {"collectionGroup":"projects","queryScope":"COLLECTION","fields":[{"fieldPath":"projectType","order":"ASCENDING"},{"fieldPath":"collabParticipantIds","arrayConfig":"CONTAINS"}]},
+    {"collectionGroup":"liveSessions","queryScope":"COLLECTION","fields":[{"fieldPath":"mainBoardId","order":"ASCENDING"},{"fieldPath":"status","order":"ASCENDING"},{"fieldPath":"participantIds","arrayConfig":"CONTAINS"}]},
+    {"collectionGroup":"liveSessions","queryScope":"COLLECTION","fields":[{"fieldPath":"teacherId","order":"ASCENDING"},{"fieldPath":"status","order":"ASCENDING"}]},
+    {"collectionGroup":"invitations","queryScope":"COLLECTION","fields":[{"fieldPath":"toUserId","order":"ASCENDING"},{"fieldPath":"status","order":"ASCENDING"}]},
+    {"collectionGroup":"receivedDesigns","queryScope":"COLLECTION","fields":[{"fieldPath":"toUserId","order":"ASCENDING"},{"fieldPath":"status","order":"ASCENDING"}]}
+  ],
+  "fieldOverrides": []
+}

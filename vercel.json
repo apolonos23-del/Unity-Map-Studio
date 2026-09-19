@@ -1,0 +1,13 @@
+{
+  "framework": "vite",
+  "buildCommand": "pnpm run build",
+  "installCommand": "pnpm install --frozen-lockfile",
+  "outputDirectory": "dist/client",
+  "functions": { "api/*.ts": { "maxDuration": 60 } },
+  "routes": [
+    { "handle": "filesystem" },
+    { "src": "/api/.*", "status": 404 },
+    { "src": "/.*", "dest": "/index.html" }
+  ],
+  "crons": [{ "path": "/api/maintenance", "schedule": "0 3 * * *" }]
+}
