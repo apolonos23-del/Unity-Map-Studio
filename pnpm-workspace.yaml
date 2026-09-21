@@ -4,3 +4,6 @@ allowBuilds:
   core-js: false
   protobufjs: false
   esbuild: true
+
+overrides:
+  'jwks-rsa>jose': 4.15.9
