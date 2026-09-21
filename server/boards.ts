@@ -10,6 +10,18 @@ import {
 import { threeWayMerge } from "../src/lib/canvas/live-merge.js";
 import { emptyCanvasState, type CanvasState } from "../src/lib/canvas/types.js";
 
+const COLLAB_DIAG_VERSION = "2026-09-21.1";
+function boardDiag(event: string, details: Record<string, unknown> = {}) {
+  console.info("[COLLAB_DIAG]", {
+    version: COLLAB_DIAG_VERSION,
+    event,
+    at: Date.now(),
+    ...details,
+  });
+}
+const uidTag = (uid: string) => uid.slice(-6);
+
+
 export function validateState(value: unknown): CanvasState {
   if (!value || typeof value !== "object")
     throw new HttpError(400, "Μη έγκυρα δεδομένα σχεδίου.");
@@ -230,8 +242,16 @@ export async function storedBoard(mapId: string) {
   };
 }
 export async function loadBoard(uid: string, mapId: string) {
+  boardDiag("SERVER_LOAD_START", { mapId, uid: uidTag(uid) });
   await accessProject(uid, mapId);
   const { state, revision, savedAt } = await storedBoard(mapId);
+  boardDiag("SERVER_LOAD_OK", {
+    mapId,
+    uid: uidTag(uid),
+    revision,
+    objects: state?.objects.length ?? 0,
+    hasState: !!state,
+  });
   return { state, revision, savedAt };
 }
 /** Fencing token protects commits when a slow request outlives its distributed lock. */
@@ -265,12 +285,27 @@ export async function saveBoard(
   baseState?: CanvasState | null,
   baseRevision?: number,
 ) {
+  boardDiag("SERVER_SAVE_START", {
+    mapId,
+    uid: uidTag(uid),
+    baseRevision: baseRevision ?? null,
+    objects: state.objects.length,
+  });
   validateState(state);
   if (baseState) validateState(baseState);
   await accessProject(uid, mapId, true);
   return withBoardLock(mapId, async (fence) => {
     const previous = await storedBoard(mapId);
     const nextRevision = previous.revision + 1;
+    boardDiag("SERVER_SAVE_BASE", {
+      mapId,
+      uid: uidTag(uid),
+      previousRevision: previous.revision,
+      nextRevision,
+      previousObjects: previous.state?.objects.length ?? 0,
+      suppliedBaseRevision: baseRevision ?? null,
+      hasBaseState: baseState != null,
+    });
     if (
       baseState == null &&
       previous.state &&
@@ -285,6 +320,13 @@ export async function saveBoard(
       : state;
     validateState(next);
     const uploaded = await uploadState(next);
+    boardDiag("STORAGE_UPLOAD_OK", {
+      mapId,
+      uid: uidTag(uid),
+      nextRevision,
+      size: uploaded.size,
+      objects: next.objects.length,
+    });
     const registry = adminDb().doc(`_managedPayloads/${mapId}`);
     let oldManaged: string | undefined;
     try {
@@ -307,9 +349,21 @@ export async function saveBoard(
         tx.set(registry, { payloadRef: uploaded.payloadRef });
       });
     } catch (error) {
+      boardDiag("FIRESTORE_COMMIT_FAIL", {
+        mapId,
+        uid: uidTag(uid),
+        nextRevision,
+        message: error instanceof Error ? error.message : String(error),
+      });
       await retirePayload(uploaded.payloadRef);
       throw error;
     }
+    boardDiag("FIRESTORE_COMMIT_OK", {
+      mapId,
+      uid: uidTag(uid),
+      revision: nextRevision,
+      objects: next.objects.length,
+    });
     // Only this version's registered refs can be deleted; legacy copies may share a pointer.
     if (oldManaged && oldManaged !== uploaded.payloadRef)
       await retirePayload(oldManaged);
@@ -324,7 +378,13 @@ export async function saveBoard(
         revision: nextRevision,
         savedAt: signalSavedAt,
       });
+      boardDiag("RTDB_SIGNAL_OK", { mapId, revision: nextRevision });
     } catch (error) {
+      boardDiag("RTDB_SIGNAL_FAIL", {
+        mapId,
+        revision: nextRevision,
+        message: error instanceof Error ? error.message : String(error),
+      });
       console.warn("Board sync signal publish failed", error);
     }
 

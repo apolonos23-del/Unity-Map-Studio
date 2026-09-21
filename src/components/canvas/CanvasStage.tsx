@@ -91,6 +91,16 @@ interface Props {
 const newId = () => Math.random().toString(36).slice(2, 10);
 const now = () => Date.now();
 
+const COLLAB_DIAG_VERSION = "2026-09-21.1";
+function collabDiag(event: string, details: Record<string, unknown> = {}) {
+  console.info("[COLLAB_DIAG]", {
+    version: COLLAB_DIAG_VERSION,
+    event,
+    at: Date.now(),
+    ...details,
+  });
+}
+
 // ── factories ────────────────────────────────────────────────────────
 function baseObj() {
   return {
@@ -764,9 +774,38 @@ export function CanvasStage({
   // Always-current state for the imperative save API.
   const stateRef = useRef<CanvasState>(state);
   const remoteBaseRef = useRef<CanvasState>(emptyCanvasState());
+  const diagSessionRef = useRef(newId());
+  const pendingRemoteRenderHashRef = useRef<string | null>(null);
   useEffect(() => {
     stateRef.current = state;
-  }, [state]);
+    const renderedHash = hashCanvasState(state);
+    if (
+      liveSync &&
+      pendingRemoteRenderHashRef.current &&
+      renderedHash === pendingRemoteRenderHashRef.current
+    ) {
+      collabDiag("UI_RENDER_CONFIRMED", {
+        session: diagSessionRef.current,
+        mapId,
+        hash: renderedHash,
+        objects: state.objects.length,
+      });
+      pendingRemoteRenderHashRef.current = null;
+    }
+  }, [state, liveSync, mapId]);
+
+  useEffect(() => {
+    if (!liveSync) return;
+    collabDiag("CANVAS_CONFIG", {
+      session: diagSessionRef.current,
+      mapId,
+      liveSync: !!liveSync,
+      liveOwner: !!liveOwner,
+      readOnly: !!readOnly,
+      isActive: !!isActive,
+      hydrated,
+    });
+  }, [mapId, liveSync, liveOwner, readOnly, isActive, hydrated]);
 
   // Pointer-down tracking — used by live polling to avoid jitter while the
   // local user is mid-drag/draw. We skip the remote merge for any tick where
@@ -809,6 +848,10 @@ export function CanvasStage({
     redoRef.current = [];
     lastAppliedRevisionRef.current = 0;
     const hydrate = async () => {
+      collabDiag("HYDRATE_START", {
+        session: diagSessionRef.current,
+        mapId,
+      });
       try {
         const pendingRecovery = await mapStore.loadRecovery(mapId, true);
         let loaded: Awaited<ReturnType<typeof mapStore.loadWithMeta>> | undefined;
@@ -840,11 +883,24 @@ export function CanvasStage({
         setState(next);
         lastHashRef.current = hashCanvasState(next);
         memoryCache.set(mapId, next);
+        collabDiag("HYDRATE_OK", {
+          session: diagSessionRef.current,
+          mapId,
+          revision: loaded.revision,
+          hash: hashCanvasState(next),
+          objects: next.objects.length,
+        });
         setHydrated(true);
       } catch (error) {
         if (!alive) return;
         setLoadError(error);
         const status = (error as { status?: number })?.status;
+        collabDiag("HYDRATE_FAIL", {
+          session: diagSessionRef.current,
+          mapId,
+          status: status ?? null,
+          message: error instanceof Error ? error.message : String(error),
+        });
         setRecoveryState(
           status === 401 || status === 403
             ? null
@@ -865,10 +921,23 @@ export function CanvasStage({
     if (liveSync && !liveOwner) return;
     const h = hashCanvasState(state);
     if (h === lastHashRef.current) return;
+    collabDiag("LOCAL_DIRTY", {
+      session: diagSessionRef.current,
+      mapId,
+      hash: h,
+      lastSavedHash: lastHashRef.current,
+      objects: state.objects.length,
+    });
     mapStore.writeRecovery(mapId, state);
     onSaveStatusChange?.("dirty");
     const t = setTimeout(async () => {
       onSaveStatusChange?.("saving");
+      collabDiag("AUTOSAVE_START", {
+        session: diagSessionRef.current,
+        mapId,
+        hash: h,
+        objects: state.objects.length,
+      });
       try {
         const saved = await mapStore.save(mapId, state, {
           baseState: remoteBaseRef.current,
@@ -880,8 +949,21 @@ export function CanvasStage({
         );
         setState((current) => threeWayMerge(state, current, saved.state));
         lastHashRef.current = hashCanvasState(saved.state);
+        collabDiag("AUTOSAVE_OK", {
+          session: diagSessionRef.current,
+          mapId,
+          revision: saved.revision,
+          hash: lastHashRef.current,
+          objects: saved.state.objects.length,
+        });
         onSaveStatusChange?.("saved");
       } catch (e) {
+        collabDiag("AUTOSAVE_FAIL", {
+          session: diagSessionRef.current,
+          mapId,
+          status: (e as { status?: number })?.status ?? null,
+          message: e instanceof Error ? e.message : String(e),
+        });
         console.warn("Canvas autosave failed", e);
         // No dedicated "error" state on this simpler 3-value type — fall
         // back to "dirty" so the UI keeps showing unsaved rather than
@@ -912,7 +994,7 @@ export function CanvasStage({
     let loadingRemote = false;
     let pendingRemote = false;
 
-    const tick = async (forceLoad = false) => {
+    const tick = async (forceLoad = false, source = "poll") => {
       if (cancelled) return;
       if (typeof document !== "undefined" && document.hidden && !forceLoad)
         return;
@@ -925,23 +1007,69 @@ export function CanvasStage({
         return;
       }
       loadingRemote = true;
+      collabDiag("REMOTE_LOAD_START", {
+        session: diagSessionRef.current,
+        mapId,
+        source,
+        forceLoad,
+        lastAppliedRevision: lastAppliedRevisionRef.current,
+      });
       try {
         const { isCritical } = await import("@/lib/quota-guard");
-        if (isCritical() && !forceLoad) return;
+        if (isCritical() && !forceLoad) {
+          collabDiag("REMOTE_LOAD_SKIPPED_QUOTA", {
+            session: diagSessionRef.current,
+            mapId,
+            source,
+          });
+          return;
+        }
         const remotePayload = await mapStore.loadWithMeta(mapId);
+        collabDiag("REMOTE_LOAD_OK", {
+          session: diagSessionRef.current,
+          mapId,
+          source,
+          revision: remotePayload.revision,
+          lastAppliedRevision: lastAppliedRevisionRef.current,
+          hash: remotePayload.state ? hashCanvasState(remotePayload.state) : null,
+          objects: remotePayload.state?.objects.length ?? 0,
+        });
         if (cancelled || !remotePayload.state) return;
         if (
           !forceLoad &&
           remotePayload.revision <= lastAppliedRevisionRef.current
-        )
+        ) {
+          collabDiag("REMOTE_LOAD_STALE", {
+            session: diagSessionRef.current,
+            mapId,
+            source,
+            revision: remotePayload.revision,
+            lastAppliedRevision: lastAppliedRevisionRef.current,
+          });
           return;
+        }
 
         const remote = remotePayload.state;
         setState((prev) => {
+          const prevHash = hashCanvasState(prev);
+          const remoteHash = hashCanvasState(remote);
           const next = threeWayMerge(remoteBaseRef.current, prev, remote);
+          const nextHash = hashCanvasState(next);
           remoteBaseRef.current = remote;
           memoryCache.set(mapId, next);
-          lastHashRef.current = hashCanvasState(next);
+          lastHashRef.current = nextHash;
+          pendingRemoteRenderHashRef.current = nextHash;
+          collabDiag("STATE_UPDATED_FROM_REMOTE", {
+            session: diagSessionRef.current,
+            mapId,
+            source,
+            revision: remotePayload.revision,
+            prevHash,
+            remoteHash,
+            nextHash,
+            changed: prevHash !== nextHash,
+            objects: next.objects.length,
+          });
           return next;
         });
         lastAppliedRevisionRef.current = Math.max(
@@ -949,27 +1077,45 @@ export function CanvasStage({
           remotePayload.revision,
         );
       } catch (e) {
+        collabDiag("REMOTE_LOAD_FAIL", {
+          session: diagSessionRef.current,
+          mapId,
+          source,
+          status: (e as { status?: number })?.status ?? null,
+          message: e instanceof Error ? e.message : String(e),
+        });
         console.warn("live sync tick failed", e);
       } finally {
         loadingRemote = false;
         if (pendingRemote && !cancelled) {
           pendingRemote = false;
-          window.setTimeout(() => void tick(true), 50);
+          window.setTimeout(() => void tick(true, "pending"), 50);
         }
       }
     };
 
     const unsubscribeSignal = subscribeBoardSync(mapId, (signal) => {
-      if (signal.revision > lastAppliedRevisionRef.current) void tick(true);
+      collabDiag("SIGNAL_CALLBACK", {
+        session: diagSessionRef.current,
+        mapId,
+        revision: signal.revision,
+        savedAt: signal.savedAt,
+        lastAppliedRevision: lastAppliedRevisionRef.current,
+      });
+      if (signal.revision > lastAppliedRevisionRef.current)
+        void tick(true, "firestore-event");
     });
     const pollId = window.setInterval(
-      () => void tick(false),
+      () => void tick(false, "poll"),
       LIVE_BOARD_POLL_INTERVAL_MS,
     );
-    const initial = window.setTimeout(() => void tick(true), 300);
+    const initial = window.setTimeout(
+      () => void tick(true, "initial"),
+      300,
+    );
 
     const onPointerUp = () => {
-      if (pendingRemote) void tick(true);
+      if (pendingRemote) void tick(true, "pointer-up");
     };
     window.addEventListener("pointerup", onPointerUp);
     window.addEventListener("pointercancel", onPointerUp);

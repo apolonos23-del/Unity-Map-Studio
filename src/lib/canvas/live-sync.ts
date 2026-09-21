@@ -25,16 +25,40 @@ export function subscribeBoardSync(
   onSignal: (signal: BoardSyncSignal) => void,
 ): () => void {
   const snapshotRef = doc(db(), "projects", mapId, "snapshots", "current");
+  console.info("[COLLAB_DIAG]", {
+    version: "2026-09-21.1",
+    event: "SUBSCRIBE",
+    at: Date.now(),
+    mapId,
+    path: `projects/${mapId}/snapshots/current`,
+  });
 
-  return onSnapshot(
+  const unsubscribe = onSnapshot(
     snapshotRef,
     (snapshot) => {
-      if (!snapshot.exists()) return;
+      if (!snapshot.exists()) {
+        console.info("[COLLAB_DIAG]", {
+          version: "2026-09-21.1",
+          event: "EVENT_NO_SNAPSHOT",
+          at: Date.now(),
+          mapId,
+        });
+        return;
+      }
       const value = snapshot.data() as {
         revision?: unknown;
         savedAt?: unknown;
       };
-      if (typeof value.revision !== "number") return;
+      if (typeof value.revision !== "number") {
+        console.info("[COLLAB_DIAG]", {
+          version: "2026-09-21.1",
+          event: "EVENT_BAD_REVISION",
+          at: Date.now(),
+          mapId,
+          revisionType: typeof value.revision,
+        });
+        return;
+      }
 
       const savedAtValue = value.savedAt as FirestoreTimestampLike | number | undefined;
       const savedAt =
@@ -44,6 +68,14 @@ export function subscribeBoardSync(
             ? savedAtValue.toMillis()
             : 0;
 
+      console.info("[COLLAB_DIAG]", {
+        version: "2026-09-21.1",
+        event: "EVENT_RECEIVED",
+        at: Date.now(),
+        mapId,
+        revision: value.revision,
+        savedAt,
+      });
       onSignal({
         revision: value.revision,
         savedAt,
@@ -52,7 +84,25 @@ export function subscribeBoardSync(
     (error) => {
       // Polling in CanvasStage remains the fallback if the realtime listener
       // is temporarily unavailable, so a listener error must not crash the UI.
+      console.warn("[COLLAB_DIAG]", {
+        version: "2026-09-21.1",
+        event: "LISTENER_ERROR",
+        at: Date.now(),
+        mapId,
+        code: (error as { code?: string }).code ?? null,
+        message: error.message,
+      });
       console.warn("Board Firestore live-sync listener failed", error);
     },
   );
+
+  return () => {
+    console.info("[COLLAB_DIAG]", {
+      version: "2026-09-21.1",
+      event: "UNSUBSCRIBE",
+      at: Date.now(),
+      mapId,
+    });
+    unsubscribe();
+  };
 }
