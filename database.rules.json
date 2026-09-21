@@ -18,6 +18,13 @@
         ".write": "auth != null && (auth.token.role == 'teacher' || auth.token.role == 'therapist') && (!data.exists() || auth.uid == data.child('teacherId').val()) && (!newData.exists() || auth.uid == newData.child('teacherId').val())",
         ".validate": "newData.hasChildren(['sessionId','teacherId','teacherName','title','startedAt']) && newData.child('sessionId').isString() && newData.child('teacherName').isString() && newData.child('title').isString() && newData.child('startedAt').isNumber()"
       }
+    },
+    "boardSync": {
+      "$mapId": {
+        ".read": "auth != null",
+        ".write": false,
+        ".validate": "newData.hasChildren(['revision','savedAt']) && newData.child('revision').isNumber() && newData.child('savedAt').isNumber()"
+      }
     }
   }
 }

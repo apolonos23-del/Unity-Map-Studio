@@ -38,6 +38,7 @@ import {
   type GenogramTool,
 } from "@/lib/canvas/genogram";
 import { threeWayMerge } from "@/lib/canvas/live-merge";
+import { subscribeBoardSync } from "@/lib/canvas/live-sync";
 import {
   buildPolyPoints,
   insertBendPoint,
@@ -759,6 +760,7 @@ export function CanvasStage({
   const undoRef = useRef<CanvasState[]>([]);
   const redoRef = useRef<CanvasState[]>([]);
   const lastHashRef = useRef<string>("");
+  const lastAppliedRevisionRef = useRef<number>(0);
   // Always-current state for the imperative save API.
   const stateRef = useRef<CanvasState>(state);
   const remoteBaseRef = useRef<CanvasState>(emptyCanvasState());
@@ -805,14 +807,30 @@ export function CanvasStage({
     setEditingId(null);
     undoRef.current = [];
     redoRef.current = [];
-    lastAppliedSavedAtRef.current = 0;
-    seenRemoteIdsRef.current = new Set();
+    lastAppliedRevisionRef.current = 0;
     const hydrate = async () => {
       try {
         const pendingRecovery = await mapStore.loadRecovery(mapId, true);
-        const loaded = await mapStore.load(mapId);
+        let loaded: Awaited<ReturnType<typeof mapStore.loadWithMeta>> | undefined;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            loaded = await mapStore.loadWithMeta(mapId);
+            break;
+          } catch (error) {
+            lastError = error;
+            const status = (error as { status?: number })?.status;
+            if (![409, 502, 503].includes(status ?? 0) || attempt === 2)
+              throw error;
+            await new Promise((resolve) =>
+              window.setTimeout(resolve, 400 * 2 ** attempt),
+            );
+          }
+        }
+        if (!loaded) throw lastError ?? new Error("Board load failed");
         if (!alive) return;
-        const next = loaded ?? emptyCanvasState();
+        const next = loaded.state ?? emptyCanvasState();
+        lastAppliedRevisionRef.current = loaded.revision;
         if (
           pendingRecovery &&
           hashCanvasState(pendingRecovery) !== hashCanvasState(next)
@@ -856,6 +874,10 @@ export function CanvasStage({
           baseState: remoteBaseRef.current,
         });
         remoteBaseRef.current = saved.state;
+        lastAppliedRevisionRef.current = Math.max(
+          lastAppliedRevisionRef.current,
+          saved.revision,
+        );
         setState((current) => threeWayMerge(state, current, saved.state));
         lastHashRef.current = hashCanvasState(saved.state);
         onSaveStatusChange?.("saved");
@@ -879,60 +901,86 @@ export function CanvasStage({
     readOnly,
   ]);
 
-  // ── Live board sync (polling, NOT onSnapshot) ─────────────────────
-  // 2s poll for live sessions (real-time feel), 8s for solo boards.
-  // Cost model (live): 15 users × 1 read / 2s × 40-min = ~18k reads/session.
-  // Still well within Spark free tier for typical classroom use.
-  const LIVE_BOARD_POLL_INTERVAL_MS = liveSync ? 2_000 : 8_000;
-  const lastAppliedSavedAtRef = useRef<number>(0);
-  // Ids that have appeared in at least one remote snapshot during this
-  // live session. Used to distinguish "genuinely new local object" from
-  // "object remotely deleted but still in our stale local state".
-  const seenRemoteIdsRef = useRef<Set<string>>(new Set());
+  // ── Live board sync ───────────────────────────────────────────────
+  // RTDB carries only a tiny revision signal. The board JSON itself stays in
+  // the protected payload API. A 5s poll remains as a fallback in case a
+  // realtime signal is briefly missed or RTDB reconnects.
+  const LIVE_BOARD_POLL_INTERVAL_MS = 5_000;
   useEffect(() => {
     if (!liveSync || !hydrated) return;
     let cancelled = false;
-    seenRemoteIdsRef.current = new Set();
+    let loadingRemote = false;
+    let pendingRemote = false;
 
     const tick = async (forceLoad = false) => {
       if (cancelled) return;
-      // NOTE: deliberately NOT gated on `isActive` — every mounted tab
-      // (main lesson + every open group board) keeps syncing in the
-      // background, not just whichever one is currently visible. Switching
-      // tabs should never mean "missed the last two minutes of updates".
-      if (typeof document !== "undefined" && document.hidden) return;
-      if (pointerDownRef.current && !forceLoad) return;
+      if (typeof document !== "undefined" && document.hidden && !forceLoad)
+        return;
+      if (pointerDownRef.current) {
+        pendingRemote = true;
+        return;
+      }
+      if (loadingRemote) {
+        pendingRemote = true;
+        return;
+      }
+      loadingRemote = true;
       try {
         const { isCritical } = await import("@/lib/quota-guard");
-        if (isCritical()) return;
-        const { state: remote, savedAt } = await mapStore.loadWithMeta(mapId);
-        if (cancelled || !remote) return;
-        // Force-load on first join (forceLoad=true) even if savedAt hasn't changed.
-        // This ensures viewers see the board immediately when joining.
+        if (isCritical() && !forceLoad) return;
+        const remotePayload = await mapStore.loadWithMeta(mapId);
+        if (cancelled || !remotePayload.state) return;
         if (
           !forceLoad &&
-          (!savedAt || savedAt <= lastAppliedSavedAtRef.current)
+          remotePayload.revision <= lastAppliedRevisionRef.current
         )
           return;
+
+        const remote = remotePayload.state;
         setState((prev) => {
           const next = threeWayMerge(remoteBaseRef.current, prev, remote);
           remoteBaseRef.current = remote;
           memoryCache.set(mapId, next);
+          lastHashRef.current = hashCanvasState(next);
           return next;
         });
-        lastAppliedSavedAtRef.current = savedAt ?? 0;
+        lastAppliedRevisionRef.current = Math.max(
+          lastAppliedRevisionRef.current,
+          remotePayload.revision,
+        );
       } catch (e) {
         console.warn("live sync tick failed", e);
+      } finally {
+        loadingRemote = false;
+        if (pendingRemote && !cancelled) {
+          pendingRemote = false;
+          window.setTimeout(() => void tick(true), 50);
+        }
       }
     };
 
-    const id = window.setInterval(tick, LIVE_BOARD_POLL_INTERVAL_MS);
-    // Force-load immediately on join so viewer sees content right away.
-    const initial = window.setTimeout(() => tick(true), 500);
+    const unsubscribeSignal = subscribeBoardSync(mapId, (signal) => {
+      if (signal.revision > lastAppliedRevisionRef.current) void tick(true);
+    });
+    const pollId = window.setInterval(
+      () => void tick(false),
+      LIVE_BOARD_POLL_INTERVAL_MS,
+    );
+    const initial = window.setTimeout(() => void tick(true), 300);
+
+    const onPointerUp = () => {
+      if (pendingRemote) void tick(true);
+    };
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      unsubscribeSignal();
+      window.clearInterval(pollId);
       window.clearTimeout(initial);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
     };
   }, [liveSync, hydrated, mapId]);
 
@@ -949,6 +997,10 @@ export function CanvasStage({
             baseState: remoteBaseRef.current,
           });
           remoteBaseRef.current = saved.state;
+          lastAppliedRevisionRef.current = Math.max(
+            lastAppliedRevisionRef.current,
+            saved.revision,
+          );
           setState((current) => threeWayMerge(snapshot, current, saved.state));
           lastHashRef.current = hashCanvasState(saved.state);
           onSaveStatusChange?.("saved");
@@ -2287,6 +2339,11 @@ export function CanvasStage({
                 <p className="mt-2 text-sm text-muted-foreground">
                   Οι αλλαγές είναι κλειδωμένες μέχρι να φορτωθούν με ασφάλεια τα
                   δεδομένα.
+                </p>
+                <p className="mt-2 text-xs text-muted-foreground/80 break-words">
+                  {loadError instanceof Error
+                    ? loadError.message
+                    : "Άγνωστο σφάλμα φόρτωσης"}
                 </p>
                 <div className="mt-4 flex justify-center gap-2">
                   <button

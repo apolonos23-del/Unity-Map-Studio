@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { FieldValue, type Transaction } from "firebase-admin/firestore";
-import { adminDb } from "./admin.js";
+import { adminDb, adminRtdb } from "./admin.js";
 import { HttpError } from "./http.js";
 import {
   projectAccess,
@@ -270,6 +270,7 @@ export async function saveBoard(
   await accessProject(uid, mapId, true);
   return withBoardLock(mapId, async (fence) => {
     const previous = await storedBoard(mapId);
+    const nextRevision = previous.revision + 1;
     if (
       baseState == null &&
       previous.state &&
@@ -298,7 +299,7 @@ export async function saveBoard(
         tx.set(adminDb().doc(`projects/${mapId}/snapshots/current`), {
           ...uploaded,
           payloadSize: uploaded.size,
-          revision: previous.revision + 1,
+          revision: nextRevision,
           schemaVersion: 1,
           savedAt: FieldValue.serverTimestamp(),
           savedBy: uid,
@@ -312,12 +313,27 @@ export async function saveBoard(
     // Only this version's registered refs can be deleted; legacy copies may share a pointer.
     if (oldManaged && oldManaged !== uploaded.payloadRef)
       await retirePayload(oldManaged);
+
+    // Publish only lightweight revision metadata. Connected collaborators
+    // immediately fetch the protected payload through /api/board-payload.
+    // A failed signal must never turn a successful board save into an error;
+    // clients also keep a polling fallback.
+    const signalSavedAt = Date.now();
+    try {
+      await adminRtdb().ref(`boardSync/${mapId}`).set({
+        revision: nextRevision,
+        savedAt: signalSavedAt,
+      });
+    } catch (error) {
+      console.warn("Board sync signal publish failed", error);
+    }
+
     return {
       success: true,
       ...uploaded,
       state: next,
-      revision: previous.revision + 1,
-      savedAt: Date.now(),
+      revision: nextRevision,
+      savedAt: signalSavedAt,
     };
   });
 }
