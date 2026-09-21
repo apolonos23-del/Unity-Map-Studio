@@ -25,38 +25,25 @@ export function getFirebase() {
   if (typeof window === "undefined") {
     throw new Error("Firebase can only be used in the browser.");
   }
-
   if (!_app) {
     _app = getApps()[0] ?? initializeApp(firebaseConfig);
   }
-
   return _app;
 }
 
 export function auth(): Auth {
-  if (!_auth) {
-    _auth = getAuth(getFirebase());
-  }
+  if (!_auth) _auth = getAuth(getFirebase());
   return _auth;
 }
-
 export function db(): Firestore {
-  if (!_db) {
-    _db = getFirestore(getFirebase());
-  }
+  if (!_db) _db = getFirestore(getFirebase());
   return _db;
 }
-
 export function rtdb(): Database {
-  if (!_rtdb) {
-    _rtdb = getDatabase(getFirebase());
-  }
+  if (!_rtdb) _rtdb = getDatabase(getFirebase());
   return _rtdb;
 }
-
 export function storage(): FirebaseStorage {
-  if (!_storage) {
-    _storage = getStorage(getFirebase());
-  }
+  if (!_storage) _storage = getStorage(getFirebase());
   return _storage;
 }

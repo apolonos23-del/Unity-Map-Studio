@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { FieldValue, type Transaction } from "firebase-admin/firestore";
-import { adminDb } from "./admin";
-import { HttpError } from "./http";
+import { adminDb } from "./admin.js";
+import { HttpError } from "./http.js";
 import {
   projectAccess,
   type ProjectData,
   type SessionData,
-} from "./access-policy";
-import { threeWayMerge } from "../src/lib/canvas/live-merge";
-import { emptyCanvasState, type CanvasState } from "../src/lib/canvas/types";
+} from "./access-policy.js";
+import { threeWayMerge } from "../src/lib/canvas/live-merge.js";
+import { emptyCanvasState, type CanvasState } from "../src/lib/canvas/types.js";
 
 export function validateState(value: unknown): CanvasState {
   if (!value || typeof value !== "object")
@@ -241,7 +241,7 @@ export async function withBoardLock<T>(
 ): Promise<T> {
   const ref = adminDb().doc(`_boardLocks/${mapId}`);
   const fence = randomUUID();
-  await adminDb().runTransaction(async (tx) => {
+  await adminDb().runTransaction(async (tx: Transaction) => {
     const current = (await tx.get(ref)).data();
     if (current?.until > Date.now())
       throw new HttpError(
@@ -253,7 +253,7 @@ export async function withBoardLock<T>(
   try {
     return await operation(fence);
   } finally {
-    await adminDb().runTransaction(async (tx) => {
+    await adminDb().runTransaction(async (tx: Transaction) => {
       if ((await tx.get(ref)).data()?.fence === fence) tx.delete(ref);
     });
   }
@@ -287,7 +287,7 @@ export async function saveBoard(
     const registry = adminDb().doc(`_managedPayloads/${mapId}`);
     let oldManaged: string | undefined;
     try {
-      await adminDb().runTransaction(async (tx) => {
+      await adminDb().runTransaction(async (tx: Transaction) => {
         await accessProject(uid, mapId, true, tx);
         const lock = (
           await tx.get(adminDb().doc(`_boardLocks/${mapId}`))

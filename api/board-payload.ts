@@ -8,8 +8,8 @@ import {
   type ApiRequest,
   type ApiResponse,
   HttpError,
-} from "../server/http";
-import { loadBoard, saveBoard, validateState } from "../server/boards";
+} from "../server/http.js";
+import { loadBoard, saveBoard, validateState } from "../server/boards.js";
 export default async function handler(req: ApiRequest, res: ApiResponse) {
   privateResponse(res);
   try {

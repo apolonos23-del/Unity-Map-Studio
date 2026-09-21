@@ -1,5 +1,5 @@
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { adminAuth, adminDb } from "./admin";
+import { adminAuth, adminDb } from "./admin.js";
 import { createHash } from "node:crypto";
 
 export class HttpError extends Error {

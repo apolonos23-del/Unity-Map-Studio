@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
-import { adminAuth, adminDb, adminRtdb } from "../server/admin";
+import { adminAuth, adminDb, adminRtdb } from "../server/admin.js";
 import {
   authenticate,
   body,
@@ -12,14 +12,14 @@ import {
   HttpError,
   type ApiRequest,
   type ApiResponse,
-} from "../server/http";
+} from "../server/http.js";
 import {
   createProject,
   copyProject,
   deleteProject,
   sendDesign,
   acceptDesign,
-} from "../server/project-service";
+} from "../server/project-service.js";
 import {
   createSession,
   createGroup,
@@ -31,9 +31,9 @@ import {
   joinSession,
   endSession,
   isTeacher,
-} from "../server/session-service";
-import { aiSettings, aiComplete } from "../server/ai-service";
-import { retirePayload } from "../server/boards";
+} from "../server/session-service.js";
+import { aiSettings, aiComplete } from "../server/ai-service.js";
+import { retirePayload } from "../server/boards.js";
 
 export default async function handler(req: ApiRequest, res: ApiResponse) {
   privateResponse(res);

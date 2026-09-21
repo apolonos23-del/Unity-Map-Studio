@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
-import { adminDb } from "./admin";
-import { HttpError, string } from "./http";
+import { adminDb } from "./admin.js";
+import { HttpError, string } from "./http.js";
 
 function encryptionKey() {
   const value = process.env.AI_ENCRYPTION_KEY;

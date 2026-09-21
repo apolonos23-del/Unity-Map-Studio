@@ -1,5 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
-import { adminDb } from "./admin";
+import { adminDb } from "./admin.js";
 import {
   accessProject,
   storedBoard,
@@ -7,9 +7,9 @@ import {
   retirePayload,
   withBoardLock,
   downloadState,
-} from "./boards";
-import { HttpError, string, id } from "./http";
-import type { CanvasState } from "../src/lib/canvas/types";
+} from "./boards.js";
+import { HttpError, string, id } from "./http.js";
+import type { CanvasState } from "../src/lib/canvas/types.js";
 
 const workspaceTypes = [
   "case-analysis",

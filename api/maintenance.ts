@@ -1,12 +1,12 @@
 import { timingSafeEqual } from "node:crypto";
-import { cleanupPayloads } from "../server/boards";
+import { cleanupPayloads } from "../server/boards.js";
 import {
   privateResponse,
   sendError,
   HttpError,
   type ApiRequest,
   type ApiResponse,
-} from "../server/http";
+} from "../server/http.js";
 export default async function handler(req: ApiRequest, res: ApiResponse) {
   privateResponse(res);
   try {

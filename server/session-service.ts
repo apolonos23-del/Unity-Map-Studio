@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { FieldValue, type Transaction } from "firebase-admin/firestore";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { adminDb } from "./admin";
-import { HttpError, id, string } from "./http";
-import { accessProject, storedBoard } from "./boards";
-import { materializeCopy, newProject, workspace } from "./project-service";
+import { adminDb } from "./admin.js";
+import { HttpError, id, string } from "./http.js";
+import { accessProject, storedBoard } from "./boards.js";
+import { materializeCopy, newProject, workspace } from "./project-service.js";
 
 export function isTeacher(user: DecodedIdToken) {
   return user.role === "teacher" || user.role === "therapist";
