@@ -185,10 +185,14 @@ function Editor() {
   const isCollabParticipant =
     project?.projectType === "collaborative" &&
     collabParticipantIds.includes(user?.uid ?? "");
-  // A collaborative project: anyone in the participant list can co-edit,
-  // like a group — everyone else (an invite hasn't been accepted yet) is
-  // read-only. Any other project (personal/etc): always editable, same as
-  // before this feature existed.
+  // The owner is also a live collaborator even though ownerId is deliberately
+  // not duplicated inside collabParticipantIds. Without this, invited users
+  // poll/save live changes but the creator never polls the shared board.
+  const isCollaborativeEditor =
+    project?.projectType === "collaborative" &&
+    (project.ownerId === user?.uid || isCollabParticipant);
+  // A collaborative project: the owner and accepted participants can co-edit.
+  // Everyone else (for example, an invitation not accepted yet) is read-only.
   const readOnly =
     project?.viewOnly === true ||
     project?.projectType === "session_board" ||
@@ -203,10 +207,10 @@ function Editor() {
   // the "Αποθήκευση στα Έργα μου" button below) without affecting
   // anyone else's access to the shared original.
   useEffect(() => {
-    if (!isCollabParticipant) return;
+    if (!isCollaborativeEditor) return;
     setCurrentCollabProject(projectId);
     return () => setCurrentCollabProject(null);
-  }, [isCollabParticipant, projectId]);
+  }, [isCollaborativeEditor, projectId]);
 
   const [savingCollabCopy, setSavingCollabCopy] = useState(false);
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
@@ -657,8 +661,12 @@ function Editor() {
                     onSelectionChange={
                       tab.id === "main" ? handleSelectionChange : undefined
                     }
-                    liveSync={tab.id === "main" ? isCollabParticipant : false}
-                    liveOwner={tab.id === "main" ? isCollabParticipant : false}
+                    liveSync={
+                      tab.id === "main" ? isCollaborativeEditor : false
+                    }
+                    liveOwner={
+                      tab.id === "main" ? isCollaborativeEditor : false
+                    }
                     readOnly={tab.id === "main" ? readOnly : false}
                   />
                 </div>
