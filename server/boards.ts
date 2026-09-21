@@ -10,7 +10,7 @@ import {
 import { threeWayMerge } from "../src/lib/canvas/live-merge.js";
 import { emptyCanvasState, type CanvasState } from "../src/lib/canvas/types.js";
 
-const COLLAB_DIAG_VERSION = "2026-09-21.1";
+const COLLAB_DIAG_VERSION = "2026-09-21.2";
 function boardDiag(event: string, details: Record<string, unknown> = {}) {
   console.info("[COLLAB_DIAG]", {
     version: COLLAB_DIAG_VERSION,
@@ -152,6 +152,35 @@ export async function uploadState(state: CanvasState) {
 }
 export async function downloadState(ref: string): Promise<CanvasState> {
   const data = await external(`/payloads/${encodeURIComponent(ref)}`);
+  const firstPayload =
+    data.payload && typeof data.payload === "object" && !Array.isArray(data.payload)
+      ? (data.payload as Record<string, unknown>)
+      : null;
+  const secondPayload =
+    firstPayload?.payload &&
+    typeof firstPayload.payload === "object" &&
+    !Array.isArray(firstPayload.payload)
+      ? (firstPayload.payload as Record<string, unknown>)
+      : null;
+  console.info("[COLLAB_DIAG]", {
+    version: COLLAB_DIAG_VERSION,
+    event: "STORAGE_DOWNLOAD_SHAPE",
+    topKeys: Object.keys(data).sort(),
+    firstPayloadKeys: firstPayload ? Object.keys(firstPayload).sort() : [],
+    secondPayloadKeys: secondPayload ? Object.keys(secondPayload).sort() : [],
+    topHasObjects: Array.isArray(data.objects),
+    firstHasObjects: Array.isArray(firstPayload?.objects),
+    secondHasObjects: Array.isArray(secondPayload?.objects),
+    topHasNodes: Array.isArray(data.nodes),
+    firstHasNodes: Array.isArray(firstPayload?.nodes),
+    secondHasNodes: Array.isArray(secondPayload?.nodes),
+    topViewportType: typeof data.viewport,
+    firstViewportType: typeof firstPayload?.viewport,
+    secondViewportType: typeof secondPayload?.viewport,
+    topSettingsType: typeof data.settings,
+    firstSettingsType: typeof firstPayload?.settings,
+    secondSettingsType: typeof secondPayload?.settings,
+  });
   const raw = (data.payload ?? data) as Record<string, unknown>;
   const objects = Array.isArray(raw.objects)
     ? raw.objects
