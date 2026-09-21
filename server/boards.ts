@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { FieldValue, type Transaction } from "firebase-admin/firestore";
-import { adminDb, adminRtdb } from "./admin.js";
+import {
+  FieldValue,
+  type DocumentData,
+  type Transaction,
+  type WriteBatch,
+} from "firebase-admin/firestore";
+import { adminDb } from "./admin.js";
 import { HttpError } from "./http.js";
 import {
   projectAccess,
@@ -8,19 +13,11 @@ import {
   type SessionData,
 } from "./access-policy.js";
 import { threeWayMerge } from "../src/lib/canvas/live-merge.js";
-import { emptyCanvasState, type CanvasState } from "../src/lib/canvas/types.js";
+import { emptyCanvasState, type CanvasObject, type CanvasState } from "../src/lib/canvas/types.js";
 
-const COLLAB_DIAG_VERSION = "2026-09-21.2";
-function boardDiag(event: string, details: Record<string, unknown> = {}) {
-  console.info("[COLLAB_DIAG]", {
-    version: COLLAB_DIAG_VERSION,
-    event,
-    at: Date.now(),
-    ...details,
-  });
-}
-const uidTag = (uid: string) => uid.slice(-6);
-
+const FIREBASE_PAYLOAD_PREFIX = "fs_";
+const MAX_BATCH_WRITES = 425;
+const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 export function validateState(value: unknown): CanvasState {
   if (!value || typeof value !== "object")
@@ -63,125 +60,166 @@ export function validateState(value: unknown): CanvasState {
       throw new HttpError(400, "Μη έγκυρο αντικείμενο σχεδίου.");
     ids.add(o.id);
   }
-  if (Buffer.byteLength(JSON.stringify(state)) > 1_600_000)
-    throw new HttpError(
-      413,
-      "Το σχέδιο υπερβαίνει το όριο των 1,6 MB. Χωρίστε το σε περισσότερα έργα.",
-    );
-  return state;
+  return clone(state);
 }
-function storageConfig() {
+
+function boardObjects(mapId: string) {
+  return adminDb().collection(`projects/${mapId}/boardObjects`);
+}
+function boardMeta(mapId: string) {
+  return adminDb().doc(`projects/${mapId}/boardMeta/state`);
+}
+function payloadMeta(ref: string) {
+  return adminDb().doc(`_boardPayloads/${ref}`);
+}
+function payloadObjects(ref: string) {
+  return payloadMeta(ref).collection("objects");
+}
+
+async function commitOperations(
+  operations: Array<(batch: WriteBatch) => void>,
+) {
+  for (let offset = 0; offset < operations.length; offset += MAX_BATCH_WRITES) {
+    const batch = adminDb().batch();
+    for (const operation of operations.slice(offset, offset + MAX_BATCH_WRITES))
+      operation(batch);
+    await batch.commit();
+  }
+}
+
+async function writeCanonicalBoard(
+  mapId: string,
+  state: CanvasState,
+  options?: { revision?: number; savedBy?: string | null },
+) {
+  const clean = validateState(state);
+  const [existing, currentMeta] = await Promise.all([
+    boardObjects(mapId).get(),
+    boardMeta(mapId).get(),
+  ]);
+  const nextIds = new Set(clean.objects.map((object) => object.id));
+  const operations: Array<(batch: WriteBatch) => void> = [];
+
+  for (const object of clean.objects) {
+    const ref = boardObjects(mapId).doc(object.id);
+    const data = clone(object) as unknown as DocumentData;
+    operations.push((batch) => batch.set(ref, data));
+  }
+  for (const document of existing.docs) {
+    if (!nextIds.has(document.id))
+      operations.push((batch) => batch.delete(document.ref));
+  }
+
+  const currentRevision = Number(currentMeta.data()?.revision ?? 0);
+  const revision = options?.revision ?? currentRevision + 1;
+  operations.push((batch) =>
+    batch.set(
+      boardMeta(mapId),
+      {
+        settings: clone(clean.settings),
+        schemaVersion: 2,
+        revision,
+        updatedAt: FieldValue.serverTimestamp(),
+        updatedBy: options?.savedBy ?? null,
+      },
+      { merge: true },
+    ),
+  );
+  await commitOperations(operations);
+  return revision;
+}
+
+async function readCanonicalBoard(mapId: string): Promise<{
+  state: CanvasState | null;
+  revision: number;
+  savedAt: number;
+}> {
+  const [objectsSnap, metaSnap] = await Promise.all([
+    boardObjects(mapId).get(),
+    boardMeta(mapId).get(),
+  ]);
+  if (objectsSnap.empty && !metaSnap.exists) {
+    return { state: null, revision: 0, savedAt: 0 };
+  }
+  const objects = objectsSnap.docs
+    .map((document) => document.data() as CanvasObject)
+    .sort((a, b) => a.zIndex - b.zIndex);
+  const meta = metaSnap.data() ?? {};
+  return {
+    state: validateState({
+      objects,
+      viewport: { x: 0, y: 0, zoom: 1 },
+      settings:
+        meta.settings && typeof meta.settings === "object" ? meta.settings : {},
+    }),
+    revision: Number(meta.revision ?? 0),
+    savedAt: meta.updatedAt?.toMillis?.() ?? 0,
+  };
+}
+
+function legacyStorageConfig() {
   const base = (
     process.env.BOARD_STORAGE_API_URL ||
     "https://demo.unityenergetics.org/unity-map-api"
   ).replace(/\/$/, "");
   const token = process.env.BOARD_STORAGE_TOKEN;
-  if (!token)
-    throw new HttpError(503, "Δεν έχει ρυθμιστεί η υπηρεσία αποθήκευσης.");
-  if (
-    !base.startsWith("https://") &&
-    !(
-      process.env.NODE_ENV !== "production" &&
-      /^http:\/\/127\.0\.0\.1:\d+$/.test(base)
-    )
-  )
-    throw new HttpError(503, "Η υπηρεσία αποθήκευσης απαιτεί HTTPS.");
+  if (!token) return null;
   return { base, token };
 }
-async function external(path: string, method = "GET", data?: unknown) {
-  const { base, token } = storageConfig();
+
+async function legacyExternal(path: string, method = "GET") {
+  const config = legacyStorageConfig();
+  if (!config)
+    throw new HttpError(
+      503,
+      "Το παλιό σχέδιο δεν έχει ακόμη μεταφερθεί στο Firebase και λείπει το legacy storage token.",
+    );
   let response: Response;
   try {
-    response = await fetch(`${base}${path}`, {
+    response = await fetch(`${config.base}${path}`, {
       method,
       redirect: "error",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${config.token}`,
         "Content-Type": "application/json",
       },
-      ...(data === undefined ? {} : { body: JSON.stringify(data) }),
       signal: AbortSignal.timeout(15_000),
     });
   } catch {
-    throw new HttpError(
-      502,
-      "Δεν είναι δυνατή η σύνδεση με τον server αρχείων.",
-    );
+    throw new HttpError(502, "Δεν είναι δυνατή η ανάκτηση παλιού σχεδίου.");
   }
-  if (method === "DELETE" && response.status === 404) return {};
   if (!response.ok)
     throw new HttpError(
       502,
-      `Ο server αρχείων απέρριψε την ενέργεια (HTTP ${response.status}).`,
+      `Η ανάκτηση παλιού σχεδίου απέτυχε (HTTP ${response.status}).`,
     );
-  if (method === "DELETE") return {};
   const result = await response.json().catch(() => null);
   if (!result || typeof result !== "object")
-    throw new HttpError(502, "Μη έγκυρη απάντηση από τον server αρχείων.");
+    throw new HttpError(502, "Μη έγκυρη απάντηση παλιού storage.");
   return result as Record<string, unknown>;
 }
-export async function uploadState(state: CanvasState) {
-  validateState(state);
-  const payload = {
-    ...state,
-    nodes: state.objects.filter(
-      (o) => !["line", "connector", "drawing"].includes(o.type),
-    ),
-    edges: state.objects.filter((o) => ["line", "connector"].includes(o.type)),
-    drawings: state.objects.filter((o) => o.type === "drawing"),
-  };
-  const data = await external("/payloads", "POST", { payload });
-  if (
-    data.success !== true ||
-    typeof data.payloadRef !== "string" ||
-    !/^[a-zA-Z0-9_.-]+$/.test(data.payloadRef) ||
-    typeof data.payloadUrl !== "string"
-  )
-    throw new HttpError(
-      502,
-      "Η αποθήκευση δεν επιβεβαιώθηκε από τον server αρχείων.",
-    );
-  return {
-    payloadRef: data.payloadRef as string,
-    payloadUrl: data.payloadUrl as string,
-    size:
-      typeof data.size === "number"
-        ? data.size
-        : Buffer.byteLength(JSON.stringify(payload)),
-  };
+
+function unwrapLegacyPayload(value: unknown): Record<string, unknown> {
+  let current = value;
+  for (let depth = 0; depth < 6; depth++) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) break;
+    const record = current as Record<string, unknown>;
+    if (Array.isArray(record.objects) || Array.isArray(record.nodes)) return record;
+    if (record.payload && typeof record.payload === "object") {
+      current = record.payload;
+      continue;
+    }
+    break;
+  }
+  return (current && typeof current === "object" ? current : {}) as Record<
+    string,
+    unknown
+  >;
 }
-export async function downloadState(ref: string): Promise<CanvasState> {
-  const data = await external(`/payloads/${encodeURIComponent(ref)}`);
-  const firstPayload =
-    data.payload && typeof data.payload === "object" && !Array.isArray(data.payload)
-      ? (data.payload as Record<string, unknown>)
-      : null;
-  const secondPayload =
-    firstPayload?.payload &&
-    typeof firstPayload.payload === "object" &&
-    !Array.isArray(firstPayload.payload)
-      ? (firstPayload.payload as Record<string, unknown>)
-      : null;
-  console.info("[COLLAB_DIAG]", {
-    version: COLLAB_DIAG_VERSION,
-    event: "STORAGE_DOWNLOAD_SHAPE",
-    topKeys: Object.keys(data).sort(),
-    firstPayloadKeys: firstPayload ? Object.keys(firstPayload).sort() : [],
-    secondPayloadKeys: secondPayload ? Object.keys(secondPayload).sort() : [],
-    topHasObjects: Array.isArray(data.objects),
-    firstHasObjects: Array.isArray(firstPayload?.objects),
-    secondHasObjects: Array.isArray(secondPayload?.objects),
-    topHasNodes: Array.isArray(data.nodes),
-    firstHasNodes: Array.isArray(firstPayload?.nodes),
-    secondHasNodes: Array.isArray(secondPayload?.nodes),
-    topViewportType: typeof data.viewport,
-    firstViewportType: typeof firstPayload?.viewport,
-    secondViewportType: typeof secondPayload?.viewport,
-    topSettingsType: typeof data.settings,
-    firstSettingsType: typeof firstPayload?.settings,
-    secondSettingsType: typeof secondPayload?.settings,
-  });
-  const raw = (data.payload ?? data) as Record<string, unknown>;
+
+async function downloadLegacyState(ref: string): Promise<CanvasState> {
+  const data = await legacyExternal(`/payloads/${encodeURIComponent(ref)}`);
+  const raw = unwrapLegacyPayload(data);
   const objects = Array.isArray(raw.objects)
     ? raw.objects
     : Array.isArray(raw.nodes)
@@ -197,8 +235,55 @@ export async function downloadState(ref: string): Promise<CanvasState> {
     settings: raw.settings ?? {},
   });
 }
+
+/** Firebase-only immutable transfer payload used by copies and sent designs. */
+export async function uploadState(state: CanvasState) {
+  const clean = validateState(state);
+  const ref = `${FIREBASE_PAYLOAD_PREFIX}${randomUUID()}`;
+  const operations: Array<(batch: WriteBatch) => void> = [];
+  operations.push((batch) =>
+    batch.set(payloadMeta(ref), {
+      viewport: clone(clean.viewport),
+      settings: clone(clean.settings),
+      schemaVersion: 2,
+      createdAt: FieldValue.serverTimestamp(),
+      size: Buffer.byteLength(JSON.stringify(clean)),
+    }),
+  );
+  for (const object of clean.objects) {
+    const data = clone(object) as unknown as DocumentData;
+    operations.push((batch) => batch.set(payloadObjects(ref).doc(object.id), data));
+  }
+  await commitOperations(operations);
+  return {
+    payloadRef: ref,
+    payloadUrl: `firebase://${ref}`,
+    size: Buffer.byteLength(JSON.stringify(clean)),
+  };
+}
+
+export async function downloadState(ref: string): Promise<CanvasState> {
+  if (!ref.startsWith(FIREBASE_PAYLOAD_PREFIX)) return downloadLegacyState(ref);
+  const [metaSnap, objectsSnap] = await Promise.all([
+    payloadMeta(ref).get(),
+    payloadObjects(ref).get(),
+  ]);
+  if (!metaSnap.exists)
+    throw new HttpError(404, "Το αποθηκευμένο σχέδιο δεν βρέθηκε.");
+  const meta = metaSnap.data() ?? {};
+  return validateState({
+    objects: objectsSnap.docs.map((document) => document.data()),
+    viewport: meta.viewport ?? { x: 0, y: 0, zoom: 1 },
+    settings: meta.settings ?? {},
+  });
+}
+
 export async function retirePayload(ref: string | undefined) {
   if (!ref) return;
+  if (ref.startsWith(FIREBASE_PAYLOAD_PREFIX)) {
+    await adminDb().recursiveDelete(payloadMeta(ref));
+    return;
+  }
   const garbage = adminDb()
     .collection("_payloadGarbage")
     .doc(Buffer.from(ref).toString("base64url"));
@@ -206,28 +291,39 @@ export async function retirePayload(ref: string | undefined) {
     payloadRef: ref,
     createdAt: FieldValue.serverTimestamp(),
   });
-  // Grace period protects readers that already fetched the previous pointer.
 }
+
 export async function cleanupPayloads() {
   const queue = await adminDb()
     .collection("_payloadGarbage")
     .where("createdAt", "<", new Date(Date.now() - 3_600_000))
     .limit(500)
     .get();
+  const config = legacyStorageConfig();
+  if (!config) return { removed: 0, attempted: queue.size };
   const results = await Promise.allSettled(
     queue.docs.map(async (item) => {
-      await external(
-        `/payloads/${encodeURIComponent(item.data().payloadRef)}`,
-        "DELETE",
+      const ref = String(item.data().payloadRef ?? "");
+      if (!ref) return;
+      const response = await fetch(
+        `${config.base}/payloads/${encodeURIComponent(ref)}`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${config.token}` },
+          signal: AbortSignal.timeout(15_000),
+        },
       );
+      if (!response.ok && response.status !== 404)
+        throw new Error(`Legacy payload delete failed: ${response.status}`);
       await item.ref.delete();
     }),
   );
   return {
-    removed: results.filter((r) => r.status === "fulfilled").length,
+    removed: results.filter((result) => result.status === "fulfilled").length,
     attempted: queue.size,
   };
 }
+
 export async function accessProject(
   uid: string,
   mapId: string,
@@ -243,7 +339,8 @@ export async function accessProject(
   let group: { participantIds: string[] } | undefined;
   if (project.liveSessionId) {
     session = (await get(`liveSessions/${project.liveSessionId}`)).data() as
-      SessionData | undefined;
+      | SessionData
+      | undefined;
     if (project.groupRoomId)
       group = (
         await get(
@@ -256,34 +353,68 @@ export async function accessProject(
     throw new HttpError(403, "Δεν έχετε δικαίωμα για αυτή την ενέργεια.");
   return project;
 }
-export async function storedBoard(mapId: string) {
-  const data = (
-    await adminDb().doc(`projects/${mapId}/snapshots/current`).get()
-  ).data();
+
+async function migrateLegacyBoardIfNeeded(mapId: string) {
+  const canonical = await readCanonicalBoard(mapId);
+  if (canonical.state) return canonical;
+
+  const snapshotRef = adminDb().doc(`projects/${mapId}/snapshots/current`);
+  const snapshot = await snapshotRef.get();
+  const data = snapshot.data();
   let state: CanvasState | null = null;
-  if (data?.payloadRef) state = await downloadState(data.payloadRef);
+  if (data?.payloadRef) state = await downloadState(String(data.payloadRef));
   else if (data?.payload) state = validateState(data.payload);
+  if (!state) return canonical;
+
+  const revision = Math.max(1, Number(data?.revision ?? 1));
+  await writeCanonicalBoard(mapId, state, { revision, savedBy: data?.savedBy ?? null });
+  await snapshotRef.set(
+    {
+      storage: "firestore-board-v2",
+      revision,
+      schemaVersion: 2,
+      savedAt: FieldValue.serverTimestamp(),
+      savedBy: data?.savedBy ?? null,
+    },
+    { merge: false },
+  );
+  if (data?.payloadRef) {
+    await retirePayload(String(data.payloadRef));
+    await adminDb().doc(`_managedPayloads/${mapId}`).delete().catch(() => {});
+  }
+  return readCanonicalBoard(mapId);
+}
+
+export async function storedBoard(mapId: string) {
+  const board = await migrateLegacyBoardIfNeeded(mapId);
   return {
-    state,
-    revision: Number(data?.revision ?? 0),
-    savedAt: data?.savedAt?.toMillis?.() ?? 0,
-    payloadRef: data?.payloadRef as string | undefined,
+    state: board.state,
+    revision: board.revision,
+    savedAt: board.savedAt,
+    payloadRef: undefined as string | undefined,
   };
 }
+
 export async function loadBoard(uid: string, mapId: string) {
-  boardDiag("SERVER_LOAD_START", { mapId, uid: uidTag(uid) });
   await accessProject(uid, mapId);
   const { state, revision, savedAt } = await storedBoard(mapId);
-  boardDiag("SERVER_LOAD_OK", {
-    mapId,
-    uid: uidTag(uid),
-    revision,
-    objects: state?.objects.length ?? 0,
-    hasState: !!state,
-  });
   return { state, revision, savedAt };
 }
-/** Fencing token protects commits when a slow request outlives its distributed lock. */
+
+/** One-time bridge for projects created before Firebase board v2. */
+export async function prepareBoard(uid: string, mapId: string) {
+  await accessProject(uid, mapId);
+  const current = await storedBoard(mapId);
+  if (!current.state) {
+    await writeCanonicalBoard(mapId, emptyCanvasState(), {
+      revision: 0,
+      savedBy: uid,
+    });
+  }
+  return { ready: true };
+}
+
+/** Compatibility lock for old cached clients still calling /api/board-payload. */
 export async function withBoardLock<T>(
   mapId: string,
   operation: (fence: string) => Promise<T>,
@@ -293,10 +424,7 @@ export async function withBoardLock<T>(
   await adminDb().runTransaction(async (tx: Transaction) => {
     const current = (await tx.get(ref)).data();
     if (current?.until > Date.now())
-      throw new HttpError(
-        409,
-        "Μία αποθήκευση βρίσκεται σε εξέλιξη. Δοκιμάστε ξανά.",
-      );
+      throw new HttpError(409, "Μία αποθήκευση βρίσκεται σε εξέλιξη. Δοκιμάστε ξανά.");
     tx.set(ref, { fence, until: Date.now() + 55_000 });
   });
   try {
@@ -307,6 +435,8 @@ export async function withBoardLock<T>(
     });
   }
 }
+
+/** Compatibility endpoint for an old browser bundle during rollout. */
 export async function saveBoard(
   uid: string,
   mapId: string,
@@ -314,32 +444,12 @@ export async function saveBoard(
   baseState?: CanvasState | null,
   baseRevision?: number,
 ) {
-  boardDiag("SERVER_SAVE_START", {
-    mapId,
-    uid: uidTag(uid),
-    baseRevision: baseRevision ?? null,
-    objects: state.objects.length,
-  });
   validateState(state);
   if (baseState) validateState(baseState);
   await accessProject(uid, mapId, true);
-  return withBoardLock(mapId, async (fence) => {
+  return withBoardLock(mapId, async () => {
     const previous = await storedBoard(mapId);
-    const nextRevision = previous.revision + 1;
-    boardDiag("SERVER_SAVE_BASE", {
-      mapId,
-      uid: uidTag(uid),
-      previousRevision: previous.revision,
-      nextRevision,
-      previousObjects: previous.state?.objects.length ?? 0,
-      suppliedBaseRevision: baseRevision ?? null,
-      hasBaseState: baseState != null,
-    });
-    if (
-      baseState == null &&
-      previous.state &&
-      baseRevision !== previous.revision
-    )
+    if (baseState == null && previous.state && baseRevision !== previous.revision)
       throw new HttpError(
         409,
         "Το σχέδιο άλλαξε. Φορτώστε την τελευταία έκδοση πριν αποθηκεύσετε.",
@@ -347,82 +457,18 @@ export async function saveBoard(
     const next = baseState
       ? threeWayMerge(baseState, state, previous.state ?? emptyCanvasState())
       : state;
-    validateState(next);
-    const uploaded = await uploadState(next);
-    boardDiag("STORAGE_UPLOAD_OK", {
-      mapId,
-      uid: uidTag(uid),
-      nextRevision,
-      size: uploaded.size,
-      objects: next.objects.length,
+    const revision = await writeCanonicalBoard(mapId, next, {
+      revision: previous.revision + 1,
+      savedBy: uid,
     });
-    const registry = adminDb().doc(`_managedPayloads/${mapId}`);
-    let oldManaged: string | undefined;
-    try {
-      await adminDb().runTransaction(async (tx: Transaction) => {
-        await accessProject(uid, mapId, true, tx);
-        const lock = (
-          await tx.get(adminDb().doc(`_boardLocks/${mapId}`))
-        ).data();
-        oldManaged = (await tx.get(registry)).data()?.payloadRef;
-        if (lock?.fence !== fence || lock.until < Date.now())
-          throw new HttpError(409, "Η αποθήκευση χρειάζεται επανάληψη.");
-        tx.set(adminDb().doc(`projects/${mapId}/snapshots/current`), {
-          ...uploaded,
-          payloadSize: uploaded.size,
-          revision: nextRevision,
-          schemaVersion: 1,
-          savedAt: FieldValue.serverTimestamp(),
-          savedBy: uid,
-        });
-        tx.set(registry, { payloadRef: uploaded.payloadRef });
-      });
-    } catch (error) {
-      boardDiag("FIRESTORE_COMMIT_FAIL", {
-        mapId,
-        uid: uidTag(uid),
-        nextRevision,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      await retirePayload(uploaded.payloadRef);
-      throw error;
-    }
-    boardDiag("FIRESTORE_COMMIT_OK", {
-      mapId,
-      uid: uidTag(uid),
-      revision: nextRevision,
-      objects: next.objects.length,
-    });
-    // Only this version's registered refs can be deleted; legacy copies may share a pointer.
-    if (oldManaged && oldManaged !== uploaded.payloadRef)
-      await retirePayload(oldManaged);
-
-    // Publish only lightweight revision metadata. Connected collaborators
-    // immediately fetch the protected payload through /api/board-payload.
-    // A failed signal must never turn a successful board save into an error;
-    // clients also keep a polling fallback.
-    const signalSavedAt = Date.now();
-    try {
-      await adminRtdb().ref(`boardSync/${mapId}`).set({
-        revision: nextRevision,
-        savedAt: signalSavedAt,
-      });
-      boardDiag("RTDB_SIGNAL_OK", { mapId, revision: nextRevision });
-    } catch (error) {
-      boardDiag("RTDB_SIGNAL_FAIL", {
-        mapId,
-        revision: nextRevision,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      console.warn("Board sync signal publish failed", error);
-    }
-
     return {
       success: true,
-      ...uploaded,
+      payloadRef: `firestore-board:${mapId}`,
+      payloadUrl: "",
+      size: Buffer.byteLength(JSON.stringify(next)),
       state: next,
-      revision: nextRevision,
-      savedAt: signalSavedAt,
+      revision,
+      savedAt: Date.now(),
     };
   });
 }

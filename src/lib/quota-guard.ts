@@ -38,6 +38,7 @@ import {
   type UpdateData,
   type SetOptions,
   type Unsubscribe,
+  type WriteBatch,
 } from "firebase/firestore";
 
 // ── Tunable constants ────────────────────────────────────────────────
@@ -183,11 +184,25 @@ export async function cDeleteDoc<T = DocumentData>(
 export function cOnSnapshot<T = DocumentData>(
   source: DocumentReference<T> | Query<T> | CollectionReference<T>,
   cb: (snap: DocumentSnapshot<T> | QuerySnapshot<T>) => void,
+  onError?: (error: Error) => void,
 ): Unsubscribe {
-  return onSnapshot(source as never, (snap: unknown) => {
-    const s = snap as DocumentSnapshot<T> | QuerySnapshot<T>;
-    const size = (s as QuerySnapshot<T>).size;
-    recordRead(typeof size === "number" ? Math.max(1, size) : 1);
-    cb(s);
-  });
+  return onSnapshot(
+    source as never,
+    (snap: unknown) => {
+      const s = snap as DocumentSnapshot<T> | QuerySnapshot<T>;
+      const size = (s as QuerySnapshot<T>).size;
+      recordRead(typeof size === "number" ? Math.max(1, size) : 1);
+      cb(s);
+    },
+    onError,
+  );
+}
+
+/** Commit an already prepared Firestore batch while accounting for each write. */
+export async function cCommitBatch(
+  batch: WriteBatch,
+  writeCount: number,
+): Promise<void> {
+  if (writeCount > 0) recordWrite(writeCount);
+  await batch.commit();
 }

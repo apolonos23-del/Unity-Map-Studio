@@ -33,7 +33,7 @@ import {
   isTeacher,
 } from "../server/session-service.js";
 import { aiSettings, aiComplete } from "../server/ai-service.js";
-import { retirePayload } from "../server/boards.js";
+import { prepareBoard, retirePayload } from "../server/boards.js";
 
 export default async function handler(req: ApiRequest, res: ApiResponse) {
   privateResponse(res);
@@ -58,6 +58,9 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         break;
       case "delete-project":
         result = await deleteProject(user.uid, id(input.projectId));
+        break;
+      case "prepare-board":
+        result = await prepareBoard(user.uid, id(input.projectId));
         break;
       case "send-design":
         result = await sendDesign(user.uid, input);

@@ -18,6 +18,37 @@ service cloud.firestore {
         || liveReader(p));
     }
     function project(pid) { return get(/databases/$(database)/documents/projects/$(pid)).data; }
+    function groupRoom(sid, gid) { return get(/databases/$(database)/documents/liveSessions/$(sid)/groupRooms/$(gid)).data; }
+    function liveWriter(p) {
+      return signedIn()
+        && p.get('liveSessionId', null) != null
+        && session(p.liveSessionId).teacherId == p.ownerId
+        && session(p.liveSessionId).status == 'active'
+        && p.get('viewOnly', false) == false
+        && (
+          teacher(p.liveSessionId)
+          || (peer(p.liveSessionId)
+            && (
+              (p.get('groupRoomId', null) != null
+                && session(p.liveSessionId).get('groupRoomsActive', true) != false
+                && request.auth.uid in groupRoom(p.liveSessionId, p.groupRoomId).participantIds)
+              || (p.get('groupRoomId', null) == null
+                && request.auth.uid in session(p.liveSessionId).get('editPermissions', []))
+            ))
+        );
+    }
+    function projectWriter(p) {
+      return signedIn()
+        && p.get('deleting', false) == false
+        && p.get('viewOnly', false) == false
+        && (
+          (p.get('liveSessionId', null) != null && liveWriter(p))
+          || (p.get('liveSessionId', null) == null
+            && (p.ownerId == request.auth.uid
+              || (p.get('projectType', '') == 'collaborative'
+                && request.auth.uid in p.get('collabParticipantIds', []))))
+        );
+    }
     function validFolder(data) {
       return data.get('folderId', null) == null
         || get(/databases/$(database)/documents/folders/$(data.folderId)).data.ownerId == request.auth.uid;
@@ -42,6 +73,45 @@ service cloud.firestore {
         && request.resource.data.status in ['draft','saved','active_collab','archived'] && validFolder(request.resource.data);
       match /snapshots/{snapshotId} { allow read: if projectReader(project(pid)); allow write: if false; }
       match /members/{memberId} { allow read: if projectReader(project(pid)); allow write: if false; }
+      match /boardObjects/{objectId} {
+        allow read: if projectReader(project(pid));
+        allow create, update: if projectWriter(project(pid))
+          && request.resource.data.id == objectId
+          && request.resource.data.id is string
+          && request.resource.data.type in ['shape','line','connector','text','symbol','frame','drawing']
+          && request.resource.data.x is number
+          && request.resource.data.y is number
+          && request.resource.data.width is number
+          && request.resource.data.height is number
+          && request.resource.data.zIndex is number;
+        allow delete: if projectWriter(project(pid));
+      }
+      match /boardMeta/{metaId} {
+        allow read: if projectReader(project(pid));
+        allow create, update: if metaId == 'state'
+          && projectWriter(project(pid))
+          && request.resource.data.keys().hasOnly(['settings','schemaVersion','revision','updatedAt','updatedBy'])
+          && request.resource.data.settings is map
+          && request.resource.data.schemaVersion == 2
+          && request.resource.data.revision is number
+          && request.resource.data.revision >= 0
+          && request.resource.data.updatedAt is timestamp
+          && request.resource.data.updatedBy == request.auth.uid;
+        allow delete: if false;
+      }
+      match /boardViews/{uid} {
+        allow read: if self(uid) && projectReader(project(pid));
+        allow create, update: if self(uid)
+          && projectReader(project(pid))
+          && request.resource.data.keys().hasOnly(['viewport','updatedAt'])
+          && request.resource.data.viewport is map
+          && request.resource.data.viewport.x is number
+          && request.resource.data.viewport.y is number
+          && request.resource.data.viewport.zoom is number
+          && request.resource.data.viewport.zoom > 0
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if self(uid);
+      }
     }
     match /liveSessions/{sid} {
       allow read: if signedIn() && (resource.data.teacherId == request.auth.uid || request.auth.uid in resource.data.participantIds);
